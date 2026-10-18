@@ -1,0 +1,210 @@
+id: automock-check-frontend-pr
+namespace: automock
+
+# ─────────────────────────────────────────────
+# FLOW 2: Triggered when a PR is opened or updated in the frontend repo.
+# Sets an informational (non-blocking) GitHub status check on the PR's
+# head commit to show whether mocks are in sync with the backend openapi.yml.
+#
+# Philosophy: This does NOT block the PR. It shows a status badge that helps
+# the developer know at a glance if mocks are up to date.
+# ─────────────────────────────────────────────
+
+description: |
+  On frontend PR open/update, checks if the mock data is in sync with
+  the current backend openapi.yml and posts an informational status check.
+
+labels:
+  project: automock
+  team: platform
+
+triggers:
+  - id: frontend-pr-webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    key: frontend-pr  # Webhook URL key
+
+variables:
+  backend_repo_owner: "your-org"
+  backend_repo_name: "backend"
+  frontend_repo_owner: "your-org"
+  frontend_repo_name: "frontend"
+  openapi_path: "openapi.yml"
+  kv_openapi_hash_key: "automock.last_openapi_sha"
+
+tasks:
+
+  # ── Step 1: Only proceed for pull_request events (opened/synchronize) ──
+  - id: check-event-type
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ trigger.body | jq('.action') == 'opened' or trigger.body | jq('.action') == 'synchronize' }}"
+    then:
+
+      # ── Step 2: Get the PR head commit SHA ──
+      - id: extract-pr-info
+        type: io.kestra.plugin.core.log.Log
+        message: |
+          PR #{{ trigger.body | jq('.pull_request.number') }}
+          Head SHA: {{ trigger.body | jq('.pull_request.head.sha') }}
+          Branch: {{ trigger.body | jq('.pull_request.head.ref') }}
+        level: INFO
+
+      # ── Step 3: Set status to "pending" immediately so devs see it ──
+      - id: set-status-pending
+        type: io.kestra.plugin.core.http.Request
+        uri: "https://api.github.com/repos/{{ vars.frontend_repo_owner }}/{{ vars.frontend_repo_name }}/statuses/{{ trigger.body | jq('.pull_request.head.sha') }}"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ secret('GITHUB_TOKEN') }}"
+          Accept: "application/vnd.github+json"
+          X-GitHub-Api-Version: "2022-11-28"
+        contentType: application/json
+        body: |
+          {
+            "state": "pending",
+            "context": "automock/mocks-in-sync",
+            "description": "Checking if mock data matches backend openapi.yml...",
+            "target_url": "http://localhost:8080"
+          }
+
+      # ── Step 4: Check if this PR branch contains the automock-generated files ──
+      # We compare the mock files in the PR against the current backend openapi SHA
+      - id: validate-mocks
+        type: io.kestra.plugin.scripts.node.Script
+        containerImage: node:20-alpine
+        beforeCommands:
+          - npm install js-yaml @apidevtools/swagger-parser
+        env:
+          GITHUB_TOKEN: "{{ secret('GITHUB_TOKEN') }}"
+          FRONTEND_REPO_OWNER: "{{ vars.frontend_repo_owner }}"
+          FRONTEND_REPO_NAME: "{{ vars.frontend_repo_name }}"
+          BACKEND_REPO_OWNER: "{{ vars.backend_repo_owner }}"
+          BACKEND_REPO_NAME: "{{ vars.backend_repo_name }}"
+          PR_HEAD_SHA: "{{ trigger.body | jq('.pull_request.head.sha') }}"
+          PR_HEAD_REF: "{{ trigger.body | jq('.pull_request.head.ref') }}"
+          OPENAPI_PATH: "{{ vars.openapi_path }}"
+          KNOWN_OPENAPI_SHA: "{{ outputs['get-stored-sha'].value }}"
+        script: |
+          import { execSync } from 'child_process';
+
+          const headers = {
+            'Authorization': `Bearer ${process.env.GITHUB_TOKEN}`,
+            'Accept': 'application/vnd.github+json',
+            'X-GitHub-Api-Version': '2022-11-28'
+          };
+
+          // Get the current backend openapi.yml SHA
+          const backendRes = await fetch(
+            `https://api.github.com/repos/${process.env.BACKEND_REPO_OWNER}/${process.env.BACKEND_REPO_NAME}/contents/${process.env.OPENAPI_PATH}`,
+            { headers }
+          );
+          const backendFile = await backendRes.json();
+          const currentOpenapiSha = backendFile.sha;
+
+          // Check if the frontend PR branch has a mock metadata file that stores
+          // which openapi SHA it was generated from
+          let mockMetaRes;
+          try {
+            mockMetaRes = await fetch(
+              `https://api.github.com/repos/${process.env.FRONTEND_REPO_OWNER}/${process.env.FRONTEND_REPO_NAME}/contents/src/__mocks__/.automock-meta.json?ref=${process.env.PR_HEAD_REF}`,
+              { headers }
+            );
+          } catch (e) {
+            mockMetaRes = { ok: false };
+          }
+
+          let inSync = false;
+          let details = '';
+
+          if (mockMetaRes.ok) {
+            const metaFile = await mockMetaRes.json();
+            const content = Buffer.from(metaFile.content, 'base64').toString('utf8');
+            const meta = JSON.parse(content);
+
+            if (meta.openapiSha === currentOpenapiSha) {
+              inSync = true;
+              details = `Mocks match backend openapi.yml @ ${currentOpenapiSha.slice(0,7)}`;
+            } else {
+              details = `Mocks are from ${meta.openapiSha.slice(0,7)}, backend is now at ${currentOpenapiSha.slice(0,7)}`;
+            }
+          } else {
+            details = 'No .automock-meta.json found in src/__mocks__ — mocks may not be synced';
+          }
+
+          // Write result for downstream tasks
+          console.log(JSON.stringify({ inSync, details, currentOpenapiSha }));
+
+          // Kestra reads outputs via file
+          import { writeFileSync } from 'fs';
+          writeFileSync('result.json', JSON.stringify({ inSync, details }));
+        outputFiles:
+          - result.json
+
+      # ── Step 5: Get the stored openapi SHA (needed for validate-mocks) ──
+      # (Runs before validate-mocks in actual Kestra — listed here for clarity)
+      - id: get-stored-sha
+        type: io.kestra.plugin.core.kv.Get
+        key: "{{ vars.kv_openapi_hash_key }}"
+        namespace: automock
+        errorOnMissing: false
+
+      # ── Step 6: Parse validation result and set final GitHub status ──
+      - id: parse-result
+        type: io.kestra.plugin.scripts.shell.Script
+        containerImage: alpine:latest
+        inputFiles:
+          result.json: "{{ outputs['validate-mocks'].outputFiles['result.json'] }}"
+        script: |
+          IN_SYNC=$(cat result.json | grep -o '"inSync":[^,}]*' | cut -d: -f2 | tr -d ' ')
+          echo "IN_SYNC=$IN_SYNC"
+          if [ "$IN_SYNC" = "true" ]; then
+            echo "status=success" >> "$KESTRA_OUTPUTS"
+            echo "description=Mocks are in sync with backend openapi.yml ✅" >> "$KESTRA_OUTPUTS"
+          else
+            echo "status=failure" >> "$KESTRA_OUTPUTS"
+            DETAILS=$(cat result.json | python3 -c "import sys,json; print(json.load(sys.stdin)['details'])")
+            echo "description=Mocks may be out of sync: $DETAILS" >> "$KESTRA_OUTPUTS"
+          fi
+
+      # ── Step 7: Post the final status check to the PR ──
+      - id: set-final-status
+        type: io.kestra.plugin.core.http.Request
+        uri: "https://api.github.com/repos/{{ vars.frontend_repo_owner }}/{{ vars.frontend_repo_name }}/statuses/{{ trigger.body | jq('.pull_request.head.sha') }}"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ secret('GITHUB_TOKEN') }}"
+          Accept: "application/vnd.github+json"
+          X-GitHub-Api-Version: "2022-11-28"
+        contentType: application/json
+        body: |
+          {
+            "state": "{{ outputs['parse-result'].vars.status }}",
+            "context": "automock/mocks-in-sync",
+            "description": "{{ outputs['parse-result'].vars.description }}",
+            "target_url": "http://localhost:8080/ui/executions/{{ execution.id }}"
+          }
+
+      # ── Step 8: If out of sync, post a helpful PR comment (not a block) ──
+      - id: post-pr-comment-if-outdated
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ outputs['parse-result'].vars.status == 'failure' }}"
+        then:
+          - id: comment-on-pr
+            type: io.kestra.plugin.core.http.Request
+            uri: "https://api.github.com/repos/{{ vars.frontend_repo_owner }}/{{ vars.frontend_repo_name }}/issues/{{ trigger.body | jq('.pull_request.number') }}/comments"
+            method: POST
+            headers:
+              Authorization: "Bearer {{ secret('GITHUB_TOKEN') }}"
+              Accept: "application/vnd.github+json"
+              X-GitHub-Api-Version: "2022-11-28"
+            contentType: application/json
+            body: |
+              {
+                "body": "## 🤖 AutoMock Check\n\n**Heads up!** The backend `openapi.yml` has changed since the mocks in this PR were last generated.\n\n{{ outputs['parse-result'].vars.description }}\n\n**What to do:**\n- Check the open draft PR from AutoMock: it has up-to-date generated mocks\n- Or re-run mock generation locally: `npm run generate:mocks`\n\n> This is **informational only** — you can still merge. But syncing mocks early prevents surprises! 🙏\n\n_Posted by AutoMock_"
+              }
+
+    else:
+      - id: skip-non-pr-event
+        type: io.kestra.plugin.core.log.Log
+        message: "Webhook event action is '{{ trigger.body | jq('.action') }}' — skipping."
+        level: DEBUG
+

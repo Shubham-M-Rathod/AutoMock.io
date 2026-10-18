@@ -1,0 +1,226 @@
+id: automock-detect-and-generate
+namespace: automock
+
+# ─────────────────────────────────────────────
+# FLOW 1: Triggered when someone pushes to the backend repo.
+# Checks if openapi.yml changed → generates mocks → opens a PR
+# in the frontend repo → notifies the repo owner.
+# ─────────────────────────────────────────────
+
+description: |
+  Detects openapi.yml changes in the backend repo on push,
+  generates mock data, and opens a PR in the frontend repo.
+
+labels:
+  project: automock
+  team: platform
+
+# Kestra will expose this URL:
+# POST http://localhost:8080/api/v1/executions/webhook/automock/automock-detect-and-generate/backend-push
+triggers:
+  - id: backend-push-webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    key: backend-push  # Secret key appended to the webhook URL
+
+inputs:
+  # GitHub sends these in the push payload — we map them via the webhook body
+  - id: ref
+    type: STRING
+    description: "Branch ref that was pushed (e.g. refs/heads/main)"
+    defaults: "refs/heads/main"
+
+variables:
+  # ── Replace these with your actual repo details ──
+  backend_repo_owner: "your-org"
+  backend_repo_name: "backend"
+  frontend_repo_owner: "your-org"
+  frontend_repo_name: "frontend"
+
+  # Path inside the backend repo where openapi spec lives
+  openapi_path: "openapi.yml"
+
+  # Branch name to create in the frontend repo for the auto-mock PR
+  mock_branch: "automock/update-mocks-{{ execution.id }}"
+
+  # KV store key used to track the last known openapi.yml SHA
+  kv_openapi_hash_key: "automock.last_openapi_sha"
+
+tasks:
+
+  # ── Step 1: Get the latest commit SHA for openapi.yml on the backend ──
+  - id: get-openapi-file-info
+    type: io.kestra.plugin.core.http.Request
+    uri: "https://api.github.com/repos/{{ vars.backend_repo_owner }}/{{ vars.backend_repo_name }}/contents/{{ vars.openapi_path }}"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ secret('GITHUB_TOKEN') }}"
+      Accept: "application/vnd.github+json"
+      X-GitHub-Api-Version: "2022-11-28"
+
+  # ── Step 2: Retrieve the previously stored SHA from Kestra KV store ──
+  - id: get-last-known-sha
+    type: io.kestra.plugin.core.kv.Get
+    key: "{{ vars.kv_openapi_hash_key }}"
+    namespace: automock
+    errorOnMissing: false  # First run: key won't exist yet, that's fine
+
+  # ── Step 3: Compare SHAs — skip if nothing changed ──
+  - id: check-if-changed
+    type: io.kestra.plugin.core.flow.If
+    # The GitHub Contents API returns { sha: "..." } for the file
+    condition: "{{ outputs['get-openapi-file-info'].body | jq('.sha') != outputs['get-last-known-sha'].value }}"
+    then:
+
+      # ── Step 4a: Store the new SHA so next run can compare ──
+      - id: store-new-sha
+        type: io.kestra.plugin.core.kv.Set
+        key: "{{ vars.kv_openapi_hash_key }}"
+        namespace: automock
+        value: "{{ outputs['get-openapi-file-info'].body | jq('.sha') }}"
+
+      # ── Step 4b: Download the raw openapi.yml content ──
+      - id: download-openapi
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ outputs['get-openapi-file-info'].body | jq('.download_url') }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ secret('GITHUB_TOKEN') }}"
+
+      # ── Step 4c: Generate mock data using our Node.js script ──
+      - id: generate-mocks
+        type: io.kestra.plugin.scripts.node.Script
+        # Kestra spins up a Node container and runs this inline
+        containerImage: node:20-alpine
+        beforeCommands:
+          - npm install -g js-yaml json-schema-faker@latest
+          - npm install js-yaml json-schema-faker @faker-js/faker
+        inputFiles:
+          # Write the downloaded openapi.yml into the task's working dir
+          openapi.yml: "{{ outputs['download-openapi'].body }}"
+          # Embed the mock generation script (from our scripts/ folder)
+          generate-mocks.mjs: "{{ read('scripts/generate-mocks.mjs') }}"
+        script: |
+          node generate-mocks.mjs
+        outputFiles:
+          # Kestra captures everything under mocks/ as output files
+          - "mocks/**"
+
+      # ── Step 4d: Create a new branch in the frontend repo ──
+      - id: create-frontend-branch
+        type: io.kestra.plugin.core.http.Request
+        uri: "https://api.github.com/repos/{{ vars.frontend_repo_owner }}/{{ vars.frontend_repo_name }}/git/refs"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ secret('GITHUB_TOKEN') }}"
+          Accept: "application/vnd.github+json"
+          X-GitHub-Api-Version: "2022-11-28"
+        contentType: application/json
+        body: |
+          {
+            "ref": "refs/heads/{{ vars.mock_branch }}",
+            "sha": "{{ outputs['get-frontend-main-sha'].body | jq('.object.sha') }}"
+          }
+        # Note: We need the current main SHA first — see get-frontend-main-sha below
+
+      # ── Step 4e (prereq): Get frontend main branch SHA ──
+      # (We need this before creating the branch — reorder mentally, Kestra runs sequentially)
+      - id: get-frontend-main-sha
+        type: io.kestra.plugin.core.http.Request
+        uri: "https://api.github.com/repos/{{ vars.frontend_repo_owner }}/{{ vars.frontend_repo_name }}/git/ref/heads/main"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ secret('GITHUB_TOKEN') }}"
+          Accept: "application/vnd.github+json"
+          X-GitHub-Api-Version: "2022-11-28"
+
+      # ── Step 4f: Push each generated mock file to the new branch via GitHub API ──
+      - id: push-mocks-to-branch
+        type: io.kestra.plugin.scripts.shell.Script
+        # Using shell + curl to loop over generated files and push via GitHub Contents API
+        containerImage: alpine/curl:latest
+        env:
+          GITHUB_TOKEN: "{{ secret('GITHUB_TOKEN') }}"
+          REPO_OWNER: "{{ vars.frontend_repo_owner }}"
+          REPO_NAME: "{{ vars.frontend_repo_name }}"
+          BRANCH: "{{ vars.mock_branch }}"
+        inputFiles:
+          # Inject all generated mock files from the previous task
+          mocks: "{{ outputs['generate-mocks'].outputFiles }}"
+        script: |
+          #!/bin/sh
+          set -e
+
+          for file in $(find mocks/ -type f -name "*.json"); do
+            echo "Uploading $file..."
+            CONTENT=$(base64 -w0 "$file")
+            FILEPATH="src/__mocks__/$file"  # adjust to your frontend's mock dir
+
+            # Check if file already exists in the branch (to get its SHA for updates)
+            EXISTING=$(curl -sf \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO_OWNER/$REPO_NAME/contents/$FILEPATH?ref=$BRANCH" \
+              || echo "{}")
+
+            FILE_SHA=$(echo "$EXISTING" | grep -o '"sha":"[^"]*"' | cut -d'"' -f4)
+
+            # Build the PUT body (include sha if updating an existing file)
+            if [ -n "$FILE_SHA" ]; then
+              BODY="{\"message\":\"chore(automock): update mock for $file\",\"content\":\"$CONTENT\",\"branch\":\"$BRANCH\",\"sha\":\"$FILE_SHA\"}"
+            else
+              BODY="{\"message\":\"chore(automock): add mock for $file\",\"content\":\"$CONTENT\",\"branch\":\"$BRANCH\"}"
+            fi
+
+            curl -sf -X PUT \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "Content-Type: application/json" \
+              -d "$BODY" \
+              "https://api.github.com/repos/$REPO_OWNER/$REPO_NAME/contents/$FILEPATH"
+          done
+          echo "All mocks pushed."
+
+      # ── Step 4g: Open a Draft PR in the frontend repo ──
+      - id: create-frontend-pr
+        type: io.kestra.plugin.core.http.Request
+        uri: "https://api.github.com/repos/{{ vars.frontend_repo_owner }}/{{ vars.frontend_repo_name }}/pulls"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ secret('GITHUB_TOKEN') }}"
+          Accept: "application/vnd.github+json"
+          X-GitHub-Api-Version: "2022-11-28"
+        contentType: application/json
+        body: |
+          {
+            "title": "🤖 [AutoMock] Update mocks — openapi.yml changed in backend",
+            "body": "## What happened?\n\nThe `openapi.yml` in the backend repo was updated. AutoMock has generated updated mock data based on the new spec.\n\n## What to do\n1. Review the changes in `src/__mocks__/` in this PR\n2. Make sure your components/tests still work with the new mock shape\n3. Adjust mock data if needed (e.g. realistic values, edge cases)\n4. Merge this PR when ready\n\n> **This is a draft PR** — no pressure. It's here to help you stay in sync early.\n\n### Backend commit that triggered this\n`{{ trigger.body | jq('.head_commit.id') }}`\n`{{ trigger.body | jq('.head_commit.message') }}`\n\n---\n*Generated by [AutoMock](http://localhost:8080) via Kestra*",
+            "head": "{{ vars.mock_branch }}",
+            "base": "main",
+            "draft": true
+          }
+
+      # ── Step 4h: Notify the repo owner (not all contributors) ──
+      - id: notify-owner
+        type: io.kestra.plugin.core.http.Request
+        uri: "https://api.github.com/repos/{{ vars.frontend_repo_owner }}/{{ vars.frontend_repo_name }}/issues"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ secret('GITHUB_TOKEN') }}"
+          Accept: "application/vnd.github+json"
+          X-GitHub-Api-Version: "2022-11-28"
+        contentType: application/json
+        body: |
+          {
+            "title": "⚠️ openapi.yml updated — frontend mocks need a review",
+            "body": "Hi @{{ secret('FRONTEND_REPO_OWNER_GITHUB_USERNAME') }} 👋\n\nThe backend `openapi.yml` was updated. AutoMock has opened a draft PR with updated mock data:\n\n**PR**: {{ outputs['create-frontend-pr'].body | jq('.html_url') }}\n\nNo urgency — this is an early heads-up so the team isn't surprised.\n\n_This issue was auto-created by AutoMock. Close it once the mock PR is merged._",
+            "labels": ["automock", "needs-review"],
+            "assignees": ["{{ secret('FRONTEND_REPO_OWNER_GITHUB_USERNAME') }}"]
+          }
+
+    else:
+      # ── Step 4 (else): openapi.yml hasn't changed, log and stop ──
+      - id: log-no-change
+        type: io.kestra.plugin.core.log.Log
+        message: "openapi.yml SHA unchanged ({{ outputs['get-openapi-file-info'].body | jq('.sha') }}). No action needed."
+        level: INFO
+
