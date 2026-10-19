@@ -1,0 +1,4 @@
+.env
+mocks
+node_modules
+openapi.yml

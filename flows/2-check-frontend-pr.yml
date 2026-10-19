@@ -24,10 +24,10 @@ triggers:
     key: frontend-pr  # Webhook URL key
 
 variables:
-  backend_repo_owner: "your-org"
-  backend_repo_name: "backend"
-  frontend_repo_owner: "your-org"
-  frontend_repo_name: "frontend"
+  backend_repo_owner: "Shubham-M-Rathod"
+  backend_repo_name: "mockBackend"
+  frontend_repo_owner: "Shubham-M-Rathod"
+  frontend_repo_name: "mockFrontend"
   openapi_path: "openapi.yml"
   kv_openapi_hash_key: "automock.last_openapi_sha"
 
@@ -54,7 +54,7 @@ tasks:
         uri: "https://api.github.com/repos/{{ vars.frontend_repo_owner }}/{{ vars.frontend_repo_name }}/statuses/{{ trigger.body | jq('.pull_request.head.sha') }}"
         method: POST
         headers:
-          Authorization: "Bearer {{ secret('GITHUB_TOKEN') }}"
+          Authorization: "Bearer {{ envs.github_token }}"
           Accept: "application/vnd.github+json"
           X-GitHub-Api-Version: "2022-11-28"
         contentType: application/json
@@ -74,7 +74,7 @@ tasks:
         beforeCommands:
           - npm install js-yaml @apidevtools/swagger-parser
         env:
-          GITHUB_TOKEN: "{{ secret('GITHUB_TOKEN') }}"
+          GITHUB_TOKEN: "{{ envs.github_token }}"
           FRONTEND_REPO_OWNER: "{{ vars.frontend_repo_owner }}"
           FRONTEND_REPO_NAME: "{{ vars.frontend_repo_name }}"
           BACKEND_REPO_OWNER: "{{ vars.backend_repo_owner }}"
@@ -101,13 +101,19 @@ tasks:
           const currentOpenapiSha = backendFile.sha;
 
           // Check if the frontend PR branch has a mock metadata file that stores
-          // which openapi SHA it was generated from
+          // which openapi SHA it was generated from (check mocks/ first, then src/__mocks__/)
           let mockMetaRes;
           try {
             mockMetaRes = await fetch(
-              `https://api.github.com/repos/${process.env.FRONTEND_REPO_OWNER}/${process.env.FRONTEND_REPO_NAME}/contents/src/__mocks__/.automock-meta.json?ref=${process.env.PR_HEAD_REF}`,
+              `https://api.github.com/repos/${process.env.FRONTEND_REPO_OWNER}/${process.env.FRONTEND_REPO_NAME}/contents/mocks/.automock-meta.json?ref=${process.env.PR_HEAD_REF}`,
               { headers }
             );
+            if (!mockMetaRes.ok) {
+              mockMetaRes = await fetch(
+                `https://api.github.com/repos/${process.env.FRONTEND_REPO_OWNER}/${process.env.FRONTEND_REPO_NAME}/contents/src/__mocks__/.automock-meta.json?ref=${process.env.PR_HEAD_REF}`,
+                { headers }
+              );
+            }
           } catch (e) {
             mockMetaRes = { ok: false };
           }
@@ -127,7 +133,7 @@ tasks:
               details = `Mocks are from ${meta.openapiSha.slice(0,7)}, backend is now at ${currentOpenapiSha.slice(0,7)}`;
             }
           } else {
-            details = 'No .automock-meta.json found in src/__mocks__ — mocks may not be synced';
+            details = 'No .automock-meta.json found in mocks/ — mocks may not be synced';
           }
 
           // Write result for downstream tasks
@@ -171,7 +177,7 @@ tasks:
         uri: "https://api.github.com/repos/{{ vars.frontend_repo_owner }}/{{ vars.frontend_repo_name }}/statuses/{{ trigger.body | jq('.pull_request.head.sha') }}"
         method: POST
         headers:
-          Authorization: "Bearer {{ secret('GITHUB_TOKEN') }}"
+          Authorization: "Bearer {{ envs.github_token }}"
           Accept: "application/vnd.github+json"
           X-GitHub-Api-Version: "2022-11-28"
         contentType: application/json
@@ -193,7 +199,7 @@ tasks:
             uri: "https://api.github.com/repos/{{ vars.frontend_repo_owner }}/{{ vars.frontend_repo_name }}/issues/{{ trigger.body | jq('.pull_request.number') }}/comments"
             method: POST
             headers:
-              Authorization: "Bearer {{ secret('GITHUB_TOKEN') }}"
+              Authorization: "Bearer {{ envs.github_token }}"
               Accept: "application/vnd.github+json"
               X-GitHub-Api-Version: "2022-11-28"
             contentType: application/json

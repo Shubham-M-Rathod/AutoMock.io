@@ -21,6 +21,8 @@ services:
 
   kestra:
     image: kestra/kestra:latest
+    env_file:
+      - .env
     pull_policy: always
     restart: unless-stopped
     # Kestra, by default, has a termination grace period of 5m. We need to wait a little more to be sure no active tasks are running.
@@ -28,11 +30,12 @@ services:
     # Note that this setup with a root user is intended for development purpose.
     # Our base image runs without root, but the Docker Compose implementation needs root to access the Docker socket
     user: "root"
-    command: server standalone
+    command: server standalone --flow-path /app/flows
     volumes:
       - kestra-data:/app/storage
       - /var/run/docker.sock:/var/run/docker.sock
       - /tmp/kestra-wd:/tmp/kestra-wd
+      - ./flows:/app/flows
     environment:
       KESTRA_CONFIGURATION: |
         datasources:

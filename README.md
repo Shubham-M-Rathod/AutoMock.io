@@ -45,23 +45,27 @@ kestra/
 ## Setup
 
 ### 1. Start Kestra
+
 ```bash
 docker-compose up -d
 # UI at http://localhost:8080
 ```
 
-### 2. Add Secrets in Kestra UI
-Go to **Namespaces → automock → Secrets** and add:
+### 2. Configure Environment Variables
 
-| Key | Value |
-|-----|-------|
-| `GITHUB_TOKEN` | GitHub PAT with `repo` + `pull_requests` + `statuses` scope |
-| `FRONTEND_REPO_OWNER_GITHUB_USERNAME` | GitHub username of the frontend repo owner |
+In your `.env` file:
+
+```env
+# GitHub Personal Access Token (Plain text! No Base64 needed)
+ENV_GITHUB_TOKEN=ghp_your_personal_access_token_here
+```
 
 ### 3. Upload Flows
+
 In the Kestra UI → **Flows → Import**, upload both YAML files from `flows/`.
 
 Or via the API:
+
 ```bash
 # Flow 1
 curl -X POST http://localhost:8080/api/v1/flows \
@@ -77,28 +81,33 @@ curl -X POST http://localhost:8080/api/v1/flows \
 ### 4. Configure GitHub Webhooks
 
 **Backend repo** → Settings → Webhooks → Add webhook:
+
 - Payload URL: `http://<your-server>:8080/api/v1/executions/webhook/automock/automock-detect-and-generate/backend-push`
 - Content type: `application/json`
 - Events: ✅ **Pushes**
 
 **Frontend repo** → Settings → Webhooks → Add webhook:
+
 - Payload URL: `http://<your-server>:8080/api/v1/executions/webhook/automock/automock-check-frontend-pr/frontend-pr`
 - Content type: `application/json`
 - Events: ✅ **Pull requests**
 
 > For local dev, use [ngrok](https://ngrok.com) to expose `localhost:8080`:
+>
 > ```bash
 > ngrok http 8080
 > ```
 
 ### 5. Update Repo Variables in the Flows
+
 Edit both flow YAML files and replace:
+
 ```yaml
 variables:
-  backend_repo_owner: "your-org"   # ← your GitHub org or username
-  backend_repo_name: "backend"      # ← your backend repo name
-  frontend_repo_owner: "your-org"  # ← your GitHub org or username
-  frontend_repo_name: "frontend"    # ← your frontend repo name
+  backend_repo_owner: "your-org" # ← your GitHub org or username
+  backend_repo_name: "backend" # ← your backend repo name
+  frontend_repo_owner: "your-org" # ← your GitHub org or username
+  frontend_repo_name: "frontend" # ← your frontend repo name
 ```
 
 ---
@@ -124,10 +133,11 @@ src/__mocks__/
 ```
 
 **Using the MSW handlers in your tests:**
+
 ```js
 // src/mocks/browser.js
-import { setupWorker } from 'msw/browser';
-import { handlers } from '../__mocks__/msw-handlers.js';
+import { setupWorker } from "msw/browser";
+import { handlers } from "../__mocks__/msw-handlers.js";
 export const worker = setupWorker(...handlers);
 ```
 
@@ -137,8 +147,22 @@ export const worker = setupWorker(...handlers);
 
 - ✅ **Inform early** — devs get notified as soon as the backend changes, not when it's already in production
 - ✅ **Auto-generate** — no one has to remember to update mocks manually
+- ✅ **Minimum Changes (Smart Diff)** — unchanged fields (e.g. `firstName: "John"`) are preserved from existing mocks so existing frontend tests won't break and PR diffs stay tiny
 - ✅ **Non-blocking** — it's a Draft PR + status badge, never a hard gate
 - ✅ **Owner-targeted** — only the frontend repo owner gets the notification, not everyone
+
+---
+
+## 🎯 Smart Minimum-Change Mechanism
+
+When `openapi.yml` is updated, `generate-mocks.mjs` executes a schema-aware reconciliation:
+
+1. **Existing field matches schema**: Field value is preserved **untouched** (e.g. if `firstName` wasn't altered in the spec, its previous mock value remains identical).
+2. **New field added**: Only the newly added field gets a generated mock value.
+3. **Field removed**: Removed from the mock to prevent drift.
+4. **Field type changed**: Re-generated to match the new type constraint.
+
+This ensures PR diffs are clean and existing test assertions like `expect(user.firstName).toBe("John")` never break unexpectedly!
 
 ---
 
@@ -150,4 +174,3 @@ export const worker = setupWorker(...handlers);
 - [ ] Only flag breaking changes (use `openapi-diff` in the validate step)
 - [ ] Auto-close the notification issue when the mock PR is merged
 - [ ] `npm run generate:mocks` script for local re-generation
-
